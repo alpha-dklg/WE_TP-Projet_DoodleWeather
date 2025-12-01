@@ -1,0 +1,1 @@
+{"ast":null,"code":"export class Card {\n  constructor(image, style, title, subtitle) {\n    this.image = image;\n    this.style = style;\n    this.title = title;\n    this.subtitle = subtitle;\n  }\n}","map":null,"metadata":{},"sourceType":"module","externalDependencies":[]}

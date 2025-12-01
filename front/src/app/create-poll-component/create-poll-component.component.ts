@@ -1,14 +1,17 @@
-import { Component, OnInit, ViewChild } from '@angular/core';
+import { Component, OnInit, ViewChild, OnDestroy } from '@angular/core';
 import { MenuItem, MessageService } from 'primeng/api';
 import { PollService } from '../poll-service.service';
+import { WeatherService } from '../weather.service';
 import { FullCalendarComponent } from '@fullcalendar/angular';
 import frLocale from '@fullcalendar/core/locales/fr';
-import { PollChoice, Poll, User } from '../model/model';
+import { PollChoice, Poll, User, WeatherForecast } from '../model/model';
 import { ActivatedRoute } from '@angular/router';
 import { CalendarOptions, EventInput } from '@fullcalendar/core';
 import dayGridPlugin from '@fullcalendar/daygrid';
 import interactionPlugin from '@fullcalendar/interaction';
 import timeGridPlugin from '@fullcalendar/timegrid';
+import { Subject } from 'rxjs';
+import { takeUntil, debounceTime } from 'rxjs/operators';
 
 /*FullCalendarModule.registerPlugins([ // register FullCalendar plugins
   dayGridPlugin,
@@ -23,7 +26,7 @@ import timeGridPlugin from '@fullcalendar/timegrid';
   styleUrls: ['./create-poll-component.component.css'],
   providers: [MessageService, PollService, FullCalendarComponent]
 })
-export class CreatePollComponentComponent implements OnInit {
+export class CreatePollComponentComponent implements OnInit, OnDestroy {
   urlsondage = '';
   urlsondageadmin = '';
   urlsalon = '';
@@ -46,6 +49,11 @@ export class CreatePollComponentComponent implements OnInit {
   hasics = false;
   loadics = false;
   ics: string;
+
+  // Weather properties
+  weatherForecasts: Map<string, WeatherForecast> = new Map();
+  loadingWeather = false;
+  private destroy$ = new Subject<void>();
 
   @ViewChild('calendar') set content(content: FullCalendarComponent) {
     if (content) { // initially setter gets called with undefined
@@ -79,7 +87,12 @@ export class CreatePollComponentComponent implements OnInit {
   submitted = false;
 
 
-  constructor(public messageService: MessageService, public pollService: PollService, private actRoute: ActivatedRoute) { }
+  constructor(
+    public messageService: MessageService,
+    public pollService: PollService,
+    private actRoute: ActivatedRoute,
+    private weatherService: WeatherService
+  ) { }
 
   ngOnInit(): void {
     this.poll.pollChoices = [];
@@ -93,6 +106,7 @@ export class CreatePollComponentComponent implements OnInit {
       label: 'Choix de la date',
       command: () => {
         this.step = 1;
+        this.loadWeatherForecast();
       }
     },
     {
@@ -172,6 +186,9 @@ export class CreatePollComponentComponent implements OnInit {
       },
       validRange: {
         start: Date.now()
+      },
+      dayCellDidMount: (arg) => {
+        this.addWeatherIconToCell(arg);
       }
     };
 
@@ -207,8 +224,8 @@ export class CreatePollComponentComponent implements OnInit {
 
     if (this.poll.title && this.poll.location && this.poll.description) {
       this.step = 1;
-
-
+      // Charger la météo quand on passe à l'étape 1
+      this.loadWeatherForecast();
       return;
     }
     this.messageService.add(
@@ -383,5 +400,232 @@ export class CreatePollComponentComponent implements OnInit {
     }
     );
 
+  }
+
+  ngOnDestroy(): void {
+    this.destroy$.next();
+    this.destroy$.complete();
+  }
+
+  /**
+   * Charge les prévisions météo pour le lieu spécifié
+   */
+  loadWeatherForecast(): void {
+    if (!this.poll.location || this.poll.location.trim() === '') {
+      return;
+    }
+
+    this.loadingWeather = true;
+    this.weatherForecasts.clear();
+
+    this.weatherService.geocodeLocation(this.poll.location)
+      .pipe(
+        takeUntil(this.destroy$),
+        debounceTime(300)
+      )
+      .subscribe({
+        next: (coords) => {
+          this.weatherService.getWeatherForecast(coords.lat, coords.lon)
+            .pipe(takeUntil(this.destroy$))
+            .subscribe({
+              next: (forecasts) => {
+                forecasts.forEach(forecast => {
+                  const dateKey = this.formatDateKey(forecast.date);
+                  this.weatherForecasts.set(dateKey, forecast);
+                });
+                this.loadingWeather = false;
+                // Ajouter les icônes météo une fois les données chargées
+                // Utiliser requestAnimationFrame pour s'assurer que le DOM est prêt
+                requestAnimationFrame(() => {
+                  setTimeout(() => {
+                    if (this.calendarComponent) {
+                      // Ajouter les icônes directement aux cellules visibles
+                      this.addWeatherIconsToAllCells();
+                      // Forcer également un re-rendu pour déclencher dayCellDidMount
+                      this.refreshWeatherIcons();
+                    }
+                  }, 150);
+                });
+              },
+              error: (error) => {
+                console.error('Erreur chargement météo:', error);
+                this.loadingWeather = false;
+                // Pas de message d'erreur bloquant, juste un log
+              }
+            });
+        },
+        error: (error) => {
+          console.error('Erreur géocodage:', error);
+          this.loadingWeather = false;
+          // Message discret si géocodage échoue
+          this.messageService.add({
+            severity: 'info',
+            summary: 'Météo indisponible',
+            detail: 'Impossible de récupérer la météo pour ce lieu',
+            life: 3000
+          });
+        }
+      });
+  }
+
+  /**
+   * Formate une date en clé string (YYYY-MM-DD)
+   */
+  private formatDateKey(date: Date): string {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
+
+  /**
+   * Ajoute l'icône météo à une cellule de date
+   */
+  private addWeatherIconToCell(arg: any): void {
+    // Retirer l'icône existante si elle existe
+    const existingIcon = arg.el.querySelector('.weather-icon');
+    if (existingIcon) {
+      existingIcon.remove();
+    }
+
+    // Date de la cellule
+    const cellDate = new Date(arg.date);
+    const dateKey = this.formatDateKey(cellDate);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const cellDateOnly = new Date(cellDate);
+    cellDateOnly.setHours(0, 0, 0, 0);
+
+    // Vérifier si c'est une date future (pas dans le passé) et dans les 5 prochains jours
+    const daysDiff = Math.ceil((cellDateOnly.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+    const isFutureDate = daysDiff >= 0 && daysDiff <= 5;
+
+    if (isFutureDate && this.weatherForecasts.has(dateKey)) {
+      const forecast = this.weatherForecasts.get(dateKey)!;
+      const iconUrl = `https://openweathermap.org/img/wn/${forecast.icon}@2x.png`;
+      
+      const iconEl = document.createElement('img');
+      iconEl.src = iconUrl;
+      iconEl.className = 'weather-icon';
+      iconEl.alt = forecast.description;
+      iconEl.title = this.getWeatherTooltip(forecast);
+      
+      // Trouver le conteneur de la cellule
+      const dayFrame = arg.el.querySelector('.fc-daygrid-day-frame') || arg.el;
+      if (dayFrame) {
+        dayFrame.appendChild(iconEl);
+      }
+    }
+  }
+
+  /**
+   * Ajoute les icônes météo à toutes les cellules visibles
+   * Utilisé après le chargement des données météo
+   */
+  private addWeatherIconsToAllCells(): void {
+    if (!this.calendarComponent) {
+      return;
+    }
+
+    const calendarApi = this.calendarComponent.getApi();
+    const view = calendarApi.view;
+    
+    if (!view) {
+      return;
+    }
+
+    // Obtenir toutes les dates visibles dans la vue actuelle
+    const start = view.activeStart;
+    const end = view.activeEnd;
+    const currentDate = new Date(start);
+    
+    // Parcourir toutes les dates visibles
+    while (currentDate <= end) {
+      const dateKey = this.formatDateKey(currentDate);
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const cellDateOnly = new Date(currentDate);
+      cellDateOnly.setHours(0, 0, 0, 0);
+      
+      const daysDiff = Math.ceil((cellDateOnly.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+      const isFutureDate = daysDiff >= 0 && daysDiff <= 5;
+      
+      if (isFutureDate && this.weatherForecasts.has(dateKey)) {
+        // Trouver la cellule correspondante dans le DOM
+        const dayCells = document.querySelectorAll('.fc-daygrid-day');
+        dayCells.forEach((cell: Element) => {
+          const dayEl = cell as HTMLElement;
+          const dayNumber = dayEl.querySelector('.fc-daygrid-day-number');
+          
+          if (dayNumber) {
+            const dayText = dayNumber.textContent?.trim();
+            const currentDay = currentDate.getDate().toString();
+            
+            // Vérifier si c'est la bonne cellule (même jour)
+            if (dayText === currentDay || dayText === currentDay.padStart(2, '0')) {
+              // Vérifier si l'icône n'existe pas déjà
+              if (!dayEl.querySelector('.weather-icon')) {
+                const forecast = this.weatherForecasts.get(dateKey)!;
+                const iconUrl = `https://openweathermap.org/img/wn/${forecast.icon}@2x.png`;
+                
+                const iconEl = document.createElement('img');
+                iconEl.src = iconUrl;
+                iconEl.className = 'weather-icon';
+                iconEl.alt = forecast.description;
+                iconEl.title = this.getWeatherTooltip(forecast);
+                
+                const dayFrame = dayEl.querySelector('.fc-daygrid-day-frame');
+                if (dayFrame) {
+                  dayFrame.appendChild(iconEl);
+                }
+              }
+            }
+          }
+        });
+      }
+      
+      // Passer au jour suivant
+      currentDate.setDate(currentDate.getDate() + 1);
+    }
+  }
+
+  /**
+   * Retourne le tooltip avec les détails météo
+   */
+  private getWeatherTooltip(forecast: WeatherForecast): string {
+    return `${forecast.temperature.toFixed(0)}°C - ${forecast.description} - Vent: ${forecast.windSpeed.toFixed(0)} km/h - Humidité: ${forecast.humidity}%`;
+  }
+
+  /**
+   * Retourne l'icône météo pour une date donnée
+   */
+  getWeatherIcon(date: Date): string | null {
+    const dateKey = this.formatDateKey(date);
+    const forecast = this.weatherForecasts.get(dateKey);
+    return forecast ? `https://openweathermap.org/img/wn/${forecast.icon}@2x.png` : null;
+  }
+
+  /**
+   * Rafraîchit toutes les icônes météo dans le calendrier
+   * Force un re-rendu complet pour déclencher dayCellDidMount à nouveau
+   */
+  private refreshWeatherIcons(): void {
+    if (!this.calendarComponent) {
+      return;
+    }
+
+    const calendarApi = this.calendarComponent.getApi();
+    
+    // Forcer un re-rendu complet en changeant temporairement la vue
+    // Cela déclenchera dayCellDidMount pour toutes les cellules
+    const currentView = calendarApi.view.type;
+    const currentDate = calendarApi.getDate();
+    
+    // Changer la vue puis la remettre pour forcer le re-rendu
+    calendarApi.changeView(currentView === 'timeGridWeek' ? 'dayGridWeek' : 'timeGridWeek');
+    setTimeout(() => {
+      calendarApi.changeView(currentView);
+      calendarApi.gotoDate(currentDate);
+    }, 50);
   }
 }
